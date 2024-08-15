@@ -8,6 +8,7 @@ import argparse
 import functools
 from datetime import datetime
 from typing import *
+from ipdb import set_trace
 
 import numpy as np
 from matplotlib import pyplot as plt
@@ -323,11 +324,20 @@ class MyDataset(Dataset):
     def __getitem__(self, idx):
         return self.data[idx]
 
+
+lr = 0.000005
+weight_decay = 0
+beta = 0.01
+num_epochs=1000
+ckpt_freq=100
+batch_size=32
+
+
 # Initialize the dataset with the DataFrame
 dataset = MyDataset(data_path="protein_angles_100sanity_128.pt")
 dataloader = DataLoader(
     dataset,
-    batch_size=32,       # Number of samples per batch
+    batch_size=batch_size,       # Number of samples per batch
     shuffle=True,        # Shuffle the data at every epoch
     num_workers=1        # Number of subprocesses to use for data loading
 )
@@ -337,11 +347,7 @@ IFM = IntegralFlowMatcher(sigma=0.1, same_time=True, time_interp=True, noise_on_
 
 protein_angle_model = ProteinAngleFlowModel(input_size=6, proj_hid_size=128, llm_embd_size=768).to("cuda")
 
-lr = 0.000005
-weight_decay = 0
-beta = 0.01
-num_epochs=500
-ckpt_freq=50
+
 current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 exp_folder_name = f"outputs/output_{current_time}"
 os.makedirs(exp_folder_name, exist_ok=True)
@@ -388,16 +394,19 @@ for epoch in range(num_epochs):
         
         losses.append(loss.item())
         epoch_loss += loss.item()
+    wandb.log({'epoch': epoch})
     
-    total_preds = []
     if (epoch+1) % ckpt_freq == 0:
+        total_preds = []
         epoch_folder_name=f"epoch_{epoch+1}"
-        for i in tqdm(range(4)):
-            x0 = torch.randn_like(batch).unsqueeze(1).to(torch.float).to("cuda")
+        for i in tqdm(range(5)): # 5 is HARD CODED for now!!!
+            x0 = torch.randn(20, 128, 6).unsqueeze(1).to(torch.float).to("cuda") # HARD CODED for now!!!
             preds = protein_angle_model.generate(x0)[:, -1, :, :].cpu().detach()
             total_preds.append(preds)
+        set_trace()
         total_preds = torch.cat(total_preds, dim=0).reshape(-1, 6)
         angles = torch.load("protein_angles_100sanity_128.pt")
+        
         folder_name = os.path.join(exp_folder_name, epoch_folder_name)
         os.makedirs(folder_name, exist_ok=True)
         for i in range(6):
@@ -407,10 +416,13 @@ for epoch in range(num_epochs):
             plt.legend()
             plt.savefig(os.path.join(folder_name, f"angle_{i}_histogram.png"))
             plt.close()
+        torch.save(protein_angle_model.state_dict(), os.path.join(folder_name, 'model_state_dict.pth'))
 
 
 
     print("Epoch {}: loss: {}".format(epoch+1, epoch_loss))
+torch.save(protein_angle_model.state_dict(), os.path.join(exp_folder_name, "final_model_state_dict.pth"))
+
 
 wandb.finish()
         
