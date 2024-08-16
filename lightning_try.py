@@ -86,8 +86,8 @@ def main(cfg: DictConfig):
     protein_angle_flow_module = ProteinAngleFlowModule(cfg=cfg, exp_dir=exp_folder_name)
     
     devices = GPUtil.getAvailable(order='memory', limit = 8)[:cfg.experiment.num_devices]
-    trainer = pl.Trainer(logger=logger, callbacks=checkpoint_callback, **cfg.trainer)
-    trainer.fit(protein_angle_flow_module, data_module)
+    trainer = pl.Trainer(logger=logger, callbacks=checkpoint_callback, strategy=DDPStrategy(find_unused_parameters=False), **cfg.trainer)
+    trainer.fit(protein_angle_flow_module, data_module, ckpt_path=cfg.experiment.resume_path)
 
     
             

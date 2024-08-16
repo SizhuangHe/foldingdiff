@@ -4,8 +4,9 @@ experiment:
   lr: 0.000001
   weight_decay: 0.00005
   num_epochs: 2000
-  ckpt_freq: 100
+  ckpt_freq: 25
   num_devices: 2
+  resume_path: null
 data:
   batch_size: 16
   data_path: /home/sh2748/foldingdiff/protein_angles_12729_128.pt
@@ -27,13 +28,12 @@ ifm:
   sigma: 0.1
 checkpointer:
   monitor: val_loss
-  save_top_k: 3
+  save_top_k: 10
   mode: min
 trainer:
   min_epochs: 1
   max_epochs: 2000
   accelerator: gpu
-  strategy: ddp
   log_every_n_steps: 1
   check_val_every_n_epoch: 100
   accumulate_grad_batches: 2
