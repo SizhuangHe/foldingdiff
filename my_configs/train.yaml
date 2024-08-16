@@ -1,0 +1,23 @@
+experiment:
+  lr: 0.000005
+  weight_decay: 0
+  beta: 0.01
+  num_epochs: 1000
+  ckpt_freq: 100
+data:
+  batch_size: 32
+  data_path: /home/sh2748/foldingdiff/protein_angles_12729_128.pt
+model:
+  proj_hid_size: 128
+  vae:
+    vae_latent_dim: 64
+    decoder_hidden_dim: 128
+  llm:
+    num_res_per_group: 1
+    llm_name: gpt2
+    use_pretrained_weights: True
+    use_custom_gpt2_arch: False
+    llm_n_layer: 1
+    llm_n_head: 1
+ifm:
+  sigma: 0.1
