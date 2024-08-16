@@ -243,6 +243,8 @@ class ProteinAngleFlowModule(pl.LightningModule):
         mse_loss = F.mse_loss(shifted_pred_tokens, shifted_gt_tokens, reduction="none").sum(dim=-1).mean()
         kl_div = outputs['kl_divergence']
         loss = mse_loss + self.cfg.experiment.beta * kl_div
+        self.log('train_mse_loss', mse_loss.item(), on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train_kl_div', self.cfg.experiment.beta * kl_div.item(), on_step=True, on_epoch=True, prog_bar=True)
         return loss
     
     def training_step(self, batch, batch_idx):
@@ -268,8 +270,8 @@ class ProteinAngleFlowModule(pl.LightningModule):
         folder_name = os.path.join(self.exp_dir, epoch_folder_name)
         os.makedirs(folder_name, exist_ok=True)
         for i in range(6):
-            _ = plt.hist(angles.reshape(-1, 6)[:,i], bins=100, range=(-np.pi, np.pi), label="GT angles")
-            _ = plt.hist(total_preds.reshape(-1, 6)[:,i], bins=100, range=(-np.pi, np.pi), label="Predicted angles")
+            _ = plt.hist(angles.reshape(-1, 6)[:,i], bins=100, range=(-np.pi, np.pi), label="GT angles", alpha=0.5)
+            _ = plt.hist(total_preds.reshape(-1, 6)[:,i], bins=100, range=(-np.pi, np.pi), label="Predicted angles", alpha=0.5)
             
             plt.legend()
             plt.savefig(os.path.join(folder_name, f"angle_{i}_histogram.png"))
