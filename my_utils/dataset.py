@@ -14,17 +14,20 @@ class CustomDataset(Dataset):
         return self.data[idx], self.lengths[idx]
 
 class LengthBasedSampler(Sampler):
-    def __init__(self, lengths, batch_size):
+    def __init__(self, lengths, batch_size, drop_last=False):
         # Make sure the length of each protein within the same is the same
         self.lengths = lengths
         self.batch_size = batch_size
+        self.drop_last = drop_last
         
         # Group indices by length
         self.indices_by_length = {}
         for idx, length in enumerate(lengths):
-            if length.item() not in self.indices_by_length:
-                self.indices_by_length[length.item()] = []
-            self.indices_by_length[length.item()].append(idx)
+            if isinstance(length, torch.Tensor):
+                length = length.item()
+            if length not in self.indices_by_length:
+                self.indices_by_length[length] = []
+            self.indices_by_length[length].append(idx)
 
         # Create a list of batches where all sequences in each batch have the same length
         self.batches = []
@@ -41,12 +44,12 @@ class LengthBasedSampler(Sampler):
 
 class ProteinAngleDataModule(pl.LightningDataModule):
     def __init__(self, 
-        train_angles_dir="protein_angles_train.pt", 
-        train_lengths_dir="protein_lengths_train.pt", 
-        val_angles_dir="protein_angles_val.pt",
-        val_lengths_dir="protein_lengths_val.pt", 
-        test_angles_dir="protein_angles_test.pt",
-        test_lengths_dir="protein_lengths_test.pt", 
+        train_angles_dir="/home/sh2748/foldingdiff/protein_angles_train.pt", 
+        train_lengths_dir="/home/sh2748/foldingdiff/protein_lengths_train.pt", 
+        val_angles_dir="/home/sh2748/foldingdiff/protein_angles_val.pt",
+        val_lengths_dir="/home/sh2748/foldingdiff/protein_lengths_val.pt", 
+        test_angles_dir="/home/sh2748/foldingdiff/protein_angles_test.pt",
+        test_lengths_dir="/home/sh2748/foldingdiff/protein_lengths_test.pt", 
         batch_size: int = 32):
         super().__init__()
         self.train_angles_dir = train_angles_dir
@@ -64,10 +67,10 @@ class ProteinAngleDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         sampler = LengthBasedSampler(torch.load(self.train_lengths_dir), self.batch_size)
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, batch_sampler=sampler)
+        return DataLoader(self.train_dataset, batch_sampler=sampler)
     
     def val_dataloader(self):
         sampler = LengthBasedSampler(torch.load(self.val_lengths_dir), self.batch_size)
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, batch_sampler=sampler)
+        return DataLoader(self.val_dataset, batch_sampler=sampler)
 
 
