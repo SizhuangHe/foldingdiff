@@ -1,8 +1,15 @@
+import os
 import torch
+import wandb
+import matplotlib.pyplot as plt
+import numpy as np
 import torch.nn as nn
 from einops import rearrange
 from torch.distributions import Normal, kl_divergence
 from .utils import modulo_with_wrapped_range
+import pytorch_lightning as pl
+import torch.nn.functional as F
+from IntegralFlowMatching.integral_flow_matching import IntegralFlowMatcher
 
 class SimpleMLP(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, dropout_prob=0.1):
@@ -123,24 +130,14 @@ class CustomVAEDecoder(nn.Module):
 
 from transformers import GPT2Model, GPT2Config
 class ProteinAngleFlowModel(nn.Module):
-    def __init__(self, 
-        input_size, 
-        proj_hid_size,
-        llm_embd_size,
-        num_res_per_group=1,
-        llm_name="gpt2",
-        use_pretrained_weights=True,
-        use_custom_gpt2_arch=False,
-        llm_n_layer=1,
-        llm_n_head=1,
-        vae_latent_dim=128,
-        decoder_hidden_dim=256,
-    ):
+    def __init__(self, model_cfg):
         super().__init__()
-        self.num_res_per_group = num_res_per_group
-        self.proj_in = SimpleMLP(input_size=input_size, hidden_size=proj_hid_size, output_size=int(llm_embd_size/num_res_per_group))
-        self._create_llm(llm_name, use_custom_gpt2_arch, use_pretrained_weights, llm_embd_size, llm_n_layer, llm_n_head)
-        self.vae_decoder = CustomVAEDecoder(input_dim=llm_embd_size, vae_latent_dim=vae_latent_dim, decoder_hidden_dim=decoder_hidden_dim, output_dim=input_size*num_res_per_group)
+        llm_cfg = model_cfg.llm
+        vae_cfg = model_cfg.vae
+        self.num_res_per_group = llm_cfg.num_res_per_group
+        self.proj_in = SimpleMLP(input_size=model_cfg.input_size, hidden_size=model_cfg.proj_hid_size, output_size=int(llm_cfg.llm_embd_size/llm_cfg.num_res_per_group))
+        self._create_llm(llm_cfg.llm_name, llm_cfg.use_custom_gpt2_arch, llm_cfg.use_pretrained_weights, llm_cfg.llm_embd_size, llm_cfg.llm_n_layer, llm_cfg.llm_n_head)
+        self.vae_decoder = CustomVAEDecoder(input_dim=llm_cfg.llm_embd_size, vae_latent_dim=vae_cfg.vae_latent_dim, decoder_hidden_dim=vae_cfg.decoder_hidden_dim, output_dim=model_cfg.input_size*llm_cfg.num_res_per_group)
     
     def _create_llm(self, llm_name, use_custom_gpt2_arch, use_pretrained_weights, llm_embd_size, llm_n_layer, llm_n_head):
         if llm_name == "gpt2": 
@@ -220,3 +217,66 @@ class ProteinAngleFlowModel(nn.Module):
             next_tokens = self.generate_next_tokens(output_sequences)
             output_sequences = torch.cat([output_sequences, next_tokens], dim=1)
         return output_sequences
+
+class ProteinAngleFlowModule(pl.LightningModule):
+    def __init__(self, cfg, exp_dir):
+        super().__init__()
+        self.cfg = cfg
+        self.exp_dir = exp_dir
+        model_cfg = cfg.model
+        ifm_cfg = cfg.ifm
+        self.model = ProteinAngleFlowModel(model_cfg=model_cfg)
+        self.integral_flow_matcher = IntegralFlowMatcher(sigma=ifm_cfg.sigma, same_time=True, time_interp=True, noise_on_x0=True, noise_on_x1=True)
+        self.save_hyperparameters()
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.model.parameters(), lr=self.cfg.experiment.lr, weight_decay=self.cfg.experiment.weight_decay)
+
+    def model_step(self, batch):
+        x0 = torch.randn_like(batch)
+        t, xt, mu_t = self.integral_flow_matcher.sample_conditional_flow(rearrange(x0, 'b s d -> b (s d)').to("cuda"), rearrange(batch, 'b s d -> b (s d)').to("cuda"), 8,  device = "cuda")
+        xt = rearrange(xt, 'b t (s d) -> b t s d', s=x0.shape[1])
+        xt = modulo_with_wrapped_range(xt).to(torch.float32)
+        outputs = self.model(xt)
+        shifted_pred_tokens = outputs["output_embeds"][:, :-1, ...]
+        shifted_gt_tokens = xt[:,1:,...]
+        mse_loss = F.mse_loss(shifted_pred_tokens, shifted_gt_tokens, reduction="none").sum(dim=-1).mean()
+        kl_div = outputs['kl_divergence']
+        loss = mse_loss + self.cfg.experiment.beta * kl_div
+        return loss
+    
+    def training_step(self, batch, batch_idx):
+        loss = self.model_step(batch)
+        self.log('train_loss', loss.item(), on_step=True, on_epoch=True, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        print("Validation")
+        loss = self.model_step(batch)
+        self.log('val_loss', loss.item(), on_step=True, on_epoch=True, prog_bar=True)
+        
+        total_preds = []
+        epoch_folder_name=f"epoch_{self.current_epoch+1}"
+        for i in range(10): # 5 is HARD CODED for now!!!
+            x0 = torch.randn(10, 128, 6).unsqueeze(1).to(torch.float).to("cuda") # HARD CODED for now!!!
+            preds = self.model.generate(x0)[:, -1, :, :].cpu().detach()
+            total_preds.append(preds)
+        # set_trace()
+        total_preds = torch.cat(total_preds, dim=0).reshape(-1, 6)
+        angles = torch.load(self.cfg.data.data_path)[:100]
+        
+        folder_name = os.path.join(self.exp_dir, epoch_folder_name)
+        os.makedirs(folder_name, exist_ok=True)
+        for i in range(6):
+            _ = plt.hist(angles.reshape(-1, 6)[:,i], bins=100, range=(-np.pi, np.pi), label="GT angles")
+            _ = plt.hist(total_preds.reshape(-1, 6)[:,i], bins=100, range=(-np.pi, np.pi), label="Predicted angles")
+            
+            plt.legend()
+            plt.savefig(os.path.join(folder_name, f"angle_{i}_histogram.png"))
+            if self.logger is not None:
+                self.logger.experiment.log({f"angle_{i}_histogram": [wandb.Image(os.path.join(folder_name, f"angle_{i}_histogram.png"))]})
+            # wandb.log({f"angle_{i}_histogram": wandb.Image(os.path.join(folder_name, f"angle_{i}_histogram.png"))})
+            plt.close()
+        return {
+            'val_loss': loss
+        }

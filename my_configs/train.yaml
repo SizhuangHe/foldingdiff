@@ -1,18 +1,22 @@
 experiment:
-  lr: 0.000005
-  weight_decay: 0
+  debug: false
   beta: 0.01
-  num_epochs: 1000
+  lr: 0.000001
+  weight_decay: 0.00005
+  num_epochs: 2000
   ckpt_freq: 100
+  num_devices: 2
 data:
-  batch_size: 32
+  batch_size: 16
   data_path: /home/sh2748/foldingdiff/protein_angles_12729_128.pt
 model:
+  input_size: 6 # Never change this
   proj_hid_size: 128
   vae:
     vae_latent_dim: 64
     decoder_hidden_dim: 128
   llm:
+    llm_embd_size: 768
     num_res_per_group: 1
     llm_name: gpt2
     use_pretrained_weights: True
@@ -21,3 +25,20 @@ model:
     llm_n_head: 1
 ifm:
   sigma: 0.1
+checkpointer:
+  monitor: val_loss
+  save_top_k: 3
+  mode: min
+trainer:
+  min_epochs: 1
+  max_epochs: 2000
+  accelerator: gpu
+  strategy: ddp
+  log_every_n_steps: 1
+  check_val_every_n_epoch: 100
+  accumulate_grad_batches: 2
+wandb:
+  name: 128residue
+  project: foldingdiff
+  save_code: true
+  tags: []
