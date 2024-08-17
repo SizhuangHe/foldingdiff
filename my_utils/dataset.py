@@ -1,10 +1,13 @@
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split, Sampler
 import pytorch_lightning as pl
+from ipdb import set_trace
+from .custom_sampler import DistributedLengthBasedSampler, LengthBasedSampler
 
 class CustomDataset(Dataset):
     def __init__(self, data_path, lengths_path):
         self.data = torch.load(data_path)
+        # TODO: should shuffle here!
         self.lengths = torch.load(lengths_path)
 
     def __len__(self):
@@ -13,34 +16,6 @@ class CustomDataset(Dataset):
     def __getitem__(self, idx):
         return self.data[idx], self.lengths[idx]
 
-class LengthBasedSampler(Sampler):
-    def __init__(self, lengths, batch_size, drop_last=False):
-        # Make sure the length of each protein within the same is the same
-        self.lengths = lengths
-        self.batch_size = batch_size
-        self.drop_last = drop_last
-        
-        # Group indices by length
-        self.indices_by_length = {}
-        for idx, length in enumerate(lengths):
-            if isinstance(length, torch.Tensor):
-                length = length.item()
-            if length not in self.indices_by_length:
-                self.indices_by_length[length] = []
-            self.indices_by_length[length].append(idx)
-
-        # Create a list of batches where all sequences in each batch have the same length
-        self.batches = []
-        for length, indices in self.indices_by_length.items():
-            for i in range(0, len(indices), batch_size):
-                self.batches.append(indices[i:i + batch_size])
-        
-    def __iter__(self):
-        # Shuffle the batches for randomness
-        return iter(self.batches)
-    
-    def __len__(self):
-        return len(self.batches)
 
 class ProteinAngleDataModule(pl.LightningDataModule):
     def __init__(self, 
@@ -66,11 +41,22 @@ class ProteinAngleDataModule(pl.LightningDataModule):
         self.test_dataset = CustomDataset(self.test_angles_dir, self.test_lengths_dir)
 
     def train_dataloader(self):
-        sampler = LengthBasedSampler(torch.load(self.train_lengths_dir), self.batch_size)
+        rank = self.trainer.local_rank
+        if isinstance(self.trainer.gpus, list):
+            num_replicas = self.trainer.num_nodes * len(self.trainer.gpus)
+        elif isinstance(self.trainer.gpus, int):
+            num_replicas = self.trainer.num_nodes * self.trainer.gpus
+        else:
+            raise Exception("What is self.trainer.gpus?")
+        print(f"rank: {rank}, num_replicas: {num_replicas}")
+        # set_trace()
+        sampler = DistributedLengthBasedSampler(torch.load(self.train_lengths_dir), self.batch_size, drop_last=False, rank=rank, num_replicas=num_replicas)
         return DataLoader(self.train_dataset, batch_sampler=sampler)
+        # return DataLoader(self.train_dataset, batch_size=32)
     
     def val_dataloader(self):
-        sampler = LengthBasedSampler(torch.load(self.val_lengths_dir), self.batch_size)
+        sampler = DistributedLengthBasedSampler(torch.load(self.val_lengths_dir), self.batch_size)
         return DataLoader(self.val_dataset, batch_sampler=sampler)
+        # return DataLoader(self.val_dataset, batch_size=32)
 
 

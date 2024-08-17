@@ -42,7 +42,7 @@ from foldingdiff import utils
 from foldingdiff import custom_metrics as cm
 
 from my_utils.modules import ProteinAngleFlowModule
-from my_utils.dataset import MyDataset, ProteinAngleDataModule
+from my_utils.dataset import ProteinAngleDataModule
 from my_utils.utils import modulo_with_wrapped_range
 from IntegralFlowMatching.integral_flow_matching import IntegralFlowMatcher
 import argparse
@@ -67,8 +67,8 @@ def main(cfg: DictConfig):
         print("Debug mode.")
         logger = None
     else:
-        logger = WandbLogger(project='foldingdiff', log_model=True)
-    if isinstance(logger.experiment.config, wandb.sdk.wandb_config.Config):
+        logger = WandbLogger(**cfg.wandb)
+    if logger is not None and isinstance(logger.experiment.config, wandb.sdk.wandb_config.Config):
         print("Logger!")
         logger.experiment.config.update(cfg_dict)
 
@@ -82,11 +82,11 @@ def main(cfg: DictConfig):
         **cfg.checkpointer
     )
 
-    data_module = ProteinAngleDataModule(data_dir=cfg.data.data_path, batch_size=cfg.data.batch_size)
+    data_module = ProteinAngleDataModule(batch_size=cfg.data.batch_size)
     protein_angle_flow_module = ProteinAngleFlowModule(cfg=cfg, exp_dir=exp_folder_name)
-    
+    # set_trace()
     devices = GPUtil.getAvailable(order='memory', limit = 8)[:cfg.experiment.num_devices]
-    trainer = pl.Trainer(logger=logger, callbacks=checkpoint_callback, strategy=DDPStrategy(find_unused_parameters=False), **cfg.trainer)
+    trainer = pl.Trainer(replace_sampler_ddp=False,logger=logger, callbacks=checkpoint_callback, strategy=DDPStrategy(find_unused_parameters=False), devices=devices, **cfg.trainer)
     trainer.fit(protein_angle_flow_module, data_module, ckpt_path=cfg.experiment.resume_path)
 
     
