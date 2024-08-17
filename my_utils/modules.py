@@ -10,6 +10,7 @@ from .utils import modulo_with_wrapped_range
 import pytorch_lightning as pl
 import torch.nn.functional as F
 from IntegralFlowMatching.integral_flow_matching import IntegralFlowMatcher
+from ipdb import set_trace
 
 class SimpleMLP(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, dropout_prob=0.1):
@@ -134,11 +135,14 @@ class ProteinAngleFlowModel(nn.Module):
         super().__init__()
         llm_cfg = model_cfg.llm
         vae_cfg = model_cfg.vae
+        self.model_cfg=model_cfg
         self.num_res_per_group = llm_cfg.num_res_per_group
         self.proj_in = SimpleMLP(input_size=model_cfg.input_size, hidden_size=model_cfg.proj_hid_size, output_size=int(llm_cfg.llm_embd_size/llm_cfg.num_res_per_group))
         self._create_llm(llm_cfg.llm_name, llm_cfg.use_custom_gpt2_arch, llm_cfg.use_pretrained_weights, llm_cfg.llm_embd_size, llm_cfg.llm_n_layer, llm_cfg.llm_n_head)
         self.vae_decoder = CustomVAEDecoder(input_dim=llm_cfg.llm_embd_size, vae_latent_dim=vae_cfg.vae_latent_dim, decoder_hidden_dim=vae_cfg.decoder_hidden_dim, output_dim=model_cfg.input_size*llm_cfg.num_res_per_group)
-    
+        if self.model_cfg.global_pe:
+            self.global_pe_encoder = SimpleMLP(input_size=1, hidden_size=model_cfg.proj_hid_size, output_size=llm_cfg.llm_embd_size)
+
     def _create_llm(self, llm_name, use_custom_gpt2_arch, use_pretrained_weights, llm_embd_size, llm_n_layer, llm_n_head):
         if llm_name == "gpt2": 
             print("Use GPT2 as LLM.")
@@ -174,10 +178,24 @@ class ProteinAngleFlowModel(nn.Module):
                 self.llm_model = AutoModel.from_config(pythia_config)
                 print(f"Use {llm_name} model with RANDOM weights!")
 
-    def forward(self, protein_angles):
+    def _global_pe(self, batch_size, n_residues, device):
+        base_tensor = torch.arange(1, self.model_cfg.n_timepoints + 1, device=device, dtype=torch.float)
+        return base_tensor.repeat_interleave(int(n_residues/self.num_res_per_group)).unsqueeze(0).unsqueeze(-1).repeat(batch_size, 1, 1)
+
+
+
+    def forward(self, protein_angles, device):
         residue_embeds = self.proj_in(protein_angles) # [b, t, s, d]
         _b, _t, _s, _d = residue_embeds.shape
+        # print(f"Batch size: {_b}")
         group_embeds = rearrange(residue_embeds, 'b t (s0 g) d -> b (t s0) (g d)', g = self.num_res_per_group) # [b, t*s/g, g*d], g: num_res_per_group
+
+        if self.model_cfg.global_pe:
+            # set_trace()
+            time_encoding = self._global_pe(_b, _s, device)
+            time_encoding = self.global_pe_encoder(time_encoding)
+            group_embeds = group_embeds + time_encoding
+   
         llm_outputs = self.llm_model(inputs_embeds=group_embeds)
         llm_outputs_embeds = llm_outputs.last_hidden_state
         vae_outputs, vae_latents, vae_dist = self.vae_decoder(llm_outputs_embeds)
@@ -223,9 +241,9 @@ class ProteinAngleFlowModule(pl.LightningModule):
         super().__init__()
         self.cfg = cfg
         self.exp_dir = exp_dir
-        model_cfg = cfg.model
+        self.model_cfg = cfg.model
         ifm_cfg = cfg.ifm
-        self.model = ProteinAngleFlowModel(model_cfg=model_cfg)
+        self.model = ProteinAngleFlowModel(model_cfg=self.model_cfg)
         self.integral_flow_matcher = IntegralFlowMatcher(sigma=ifm_cfg.sigma, same_time=True, time_interp=True, noise_on_x0=True, noise_on_x1=True)
         self.save_hyperparameters()
 
@@ -233,11 +251,20 @@ class ProteinAngleFlowModule(pl.LightningModule):
         return torch.optim.Adam(self.model.parameters(), lr=self.cfg.experiment.lr, weight_decay=self.cfg.experiment.weight_decay)
 
     def model_step(self, batch):
-        x0 = torch.randn_like(batch)
-        t, xt, mu_t = self.integral_flow_matcher.sample_conditional_flow(rearrange(x0, 'b s d -> b (s d)').to("cuda"), rearrange(batch, 'b s d -> b (s d)').to("cuda"), 8,  device = "cuda")
+        batch_angles, length = batch
+        # set_trace()
+        # print(f"Batch angles shape:{batch_angles.shape}")
+        max_length = batch_angles.shape[1]
+        length = length[0].item()
+        batch_angles = batch_angles[:, :length, :] # discard existing pads
+        
+        x0 = torch.randn_like(batch_angles)
+        t, xt, mu_t = self.integral_flow_matcher.sample_conditional_flow(rearrange(x0, 'b s d -> b (s d)').to("cuda"), rearrange(batch_angles, 'b s d -> b (s d)').to("cuda"), self.model_cfg.n_timepoints,  device = "cuda")
         xt = rearrange(xt, 'b t (s d) -> b t s d', s=x0.shape[1])
-        xt = modulo_with_wrapped_range(xt).to(torch.float32)
-        outputs = self.model(xt)
+        xt = modulo_with_wrapped_range(xt).to(torch.float32) #[b, t, length, 6]
+
+        # set_trace()
+        outputs = self.model(xt, device=self.device)
         shifted_pred_tokens = outputs["output_embeds"][:, :-1, ...]
         shifted_gt_tokens = xt[:,1:,...]
         mse_loss = F.mse_loss(shifted_pred_tokens, shifted_gt_tokens, reduction="none").sum(dim=-1).mean()
@@ -248,6 +275,7 @@ class ProteinAngleFlowModule(pl.LightningModule):
         return loss
     
     def training_step(self, batch, batch_idx):
+        # set_trace()
         loss = self.model_step(batch)
         self.log('train_loss', loss.item(), on_step=True, on_epoch=True, prog_bar=True)
         return loss
