@@ -2,6 +2,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader, random_split, Sampler
 import pytorch_lightning as pl
 from ipdb import set_trace
+import numpy as np
 from .custom_sampler import DistributedLengthBasedSampler, LengthBasedSampler
 
 class CustomDataset(Dataset):
@@ -15,6 +16,17 @@ class CustomDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.data[idx], self.lengths[idx]
+
+class PredictionLengthDataset(Dataset):
+    def __init__(self, num_samples_per_length=10, min_length=60, max_length=128):
+        self.lengths = np.arange(min_length, max_length)
+        self.num_samples_per_length = num_samples_per_length
+    
+    def __len__(self):
+        return len(self.lengths)
+
+    def __getitem__(self, idx):
+        return self.lengths[idx], self.num_samples_per_length
 
 
 class ProteinAngleDataModule(pl.LightningDataModule):
@@ -58,5 +70,9 @@ class ProteinAngleDataModule(pl.LightningDataModule):
         sampler = DistributedLengthBasedSampler(torch.load(self.val_lengths_dir), self.batch_size)
         return DataLoader(self.val_dataset, batch_sampler=sampler)
         # return DataLoader(self.val_dataset, batch_size=32)
+    
+    def predict_dataloader(self, num_samples_per_length, min_length, max_length):
+        predict_dataset = PredictionLengthDataset(num_samples_per_length=num_samples_per_length, min_length=min_length, max_length=max_length)
+        return DataLoader(predict_dataset, batch_size=1)
 
 

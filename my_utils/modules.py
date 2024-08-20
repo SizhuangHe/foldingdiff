@@ -11,6 +11,9 @@ import pytorch_lightning as pl
 import torch.nn.functional as F
 from IntegralFlowMatching.integral_flow_matching import IntegralFlowMatcher
 from ipdb import set_trace
+import pandas as pd
+import multiprocessing
+from foldingdiff.angles_and_coords import create_new_chain_nerf
 
 class SimpleMLP(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, dropout_prob=0.1):
@@ -76,7 +79,6 @@ class MidFC(nn.Module):
         
     def forward(self, x):
         return self.layers(x)
-
 
 class CustomDecoder(nn.Module):
     def __init__(self,input_dim, hidden_dim, output_dim, num_blocks=1):
@@ -182,8 +184,6 @@ class ProteinAngleFlowModel(nn.Module):
         base_tensor = torch.arange(1, self.model_cfg.n_timepoints + 1, device=device, dtype=torch.float)
         return base_tensor.repeat_interleave(int(n_residues/self.num_res_per_group)).unsqueeze(0).unsqueeze(-1).repeat(batch_size, 1, 1)
 
-
-
     def forward(self, protein_angles, device):
         residue_embeds = self.proj_in(protein_angles) # [b, t, s, d]
         _b, _t, _s, _d = residue_embeds.shape
@@ -216,11 +216,19 @@ class ProteinAngleFlowModel(nn.Module):
             'kl_divergence': kl_divergence_z.mean()
         }
     
-    def generate_next_tokens(self, protein_angles, temperature=1):
+    def generate_next_tokens(self, protein_angles, device, temperature=1):
         assert not temperature < 0, "Temperature should be non-negative!"
         residue_embeds = self.proj_in(protein_angles) # [b, t, s, d]
         _b, _t, _s, _d = residue_embeds.shape
         group_embeds = rearrange(residue_embeds, 'b t (s0 g) d -> b (t s0) (g d)', g = self.num_res_per_group) # [b, t*s/g, g*d], g: num_res_per_group
+        
+        if self.model_cfg.global_pe:
+            time_encoding = torch.arange(1, _t+1, device=device, dtype=torch.float)
+            time_encoding = time_encoding.repeat_interleave(int(_s/self.num_res_per_group)).unsqueeze(0).unsqueeze(-1).repeat(_b, 1, 1)
+            time_encoding = self.global_pe_encoder(time_encoding)
+            group_embeds = group_embeds + time_encoding
+
+        
         llm_outputs = self.llm_model(inputs_embeds=group_embeds)
         llm_outputs_embeds = llm_outputs.last_hidden_state
         vae_outputs, vae_latents, vae_dist = self.vae_decoder(llm_outputs_embeds, temperature=temperature)
@@ -229,10 +237,10 @@ class ProteinAngleFlowModel(nn.Module):
         
         return outputs_embeds[:,-1,:,:].unsqueeze(1)
 
-    def generate(self, input_ids, temperature=1, max_length=8):
+    def generate(self, input_ids, device, temperature=1, max_length=8):
         output_sequences = input_ids
         while output_sequences.shape[1] < max_length:
-            next_tokens = self.generate_next_tokens(output_sequences)
+            next_tokens = self.generate_next_tokens(output_sequences, temperature=temperature, device=device)
             output_sequences = torch.cat([output_sequences, next_tokens], dim=1)
         return output_sequences
 
@@ -245,6 +253,7 @@ class ProteinAngleFlowModule(pl.LightningModule):
         ifm_cfg = cfg.ifm
         self.model = ProteinAngleFlowModel(model_cfg=self.model_cfg)
         self.integral_flow_matcher = IntegralFlowMatcher(sigma=ifm_cfg.sigma, same_time=True, time_interp=True, noise_on_x0=True, noise_on_x1=True)
+        self.inference_temperature = 1
         self.save_hyperparameters()
 
     def configure_optimizers(self):
@@ -252,21 +261,20 @@ class ProteinAngleFlowModule(pl.LightningModule):
 
     def model_step(self, batch):
         batch_angles, length = batch
-        # set_trace()
-        # print(f"Batch angles shape:{batch_angles.shape}")
         max_length = batch_angles.shape[1]
         length = length[0].item()
         batch_angles = batch_angles[:, :length, :] # discard existing pads
         
-        x0 = torch.randn_like(batch_angles)
+        x0 = modulo_with_wrapped_range(torch.randn_like(batch_angles))
         t, xt, mu_t = self.integral_flow_matcher.sample_conditional_flow(rearrange(x0, 'b s d -> b (s d)').to("cuda"), rearrange(batch_angles, 'b s d -> b (s d)').to("cuda"), self.model_cfg.n_timepoints,  device = "cuda")
         xt = rearrange(xt, 'b t (s d) -> b t s d', s=x0.shape[1])
         xt = modulo_with_wrapped_range(xt).to(torch.float32) #[b, t, length, 6]
 
         # set_trace()
+        
         outputs = self.model(xt, device=self.device)
         shifted_pred_tokens = outputs["output_embeds"][:, :-1, ...]
-        shifted_gt_tokens = xt[:,1:,...]
+        shifted_gt_tokens = xt[:,1:,...] 
         mse_loss = F.mse_loss(shifted_pred_tokens, shifted_gt_tokens, reduction="none").sum(dim=-1).mean()
         kl_div = outputs['kl_divergence']
         loss = mse_loss + self.cfg.experiment.beta * kl_div
@@ -288,7 +296,7 @@ class ProteinAngleFlowModule(pl.LightningModule):
         total_preds = []
         epoch_folder_name=f"epoch_{self.current_epoch+1}"
         for i in range(10): # 5 is HARD CODED for now!!!
-            x0 = torch.randn(10, 128, 6).unsqueeze(1).to(torch.float).to("cuda") # HARD CODED for now!!!
+            x0 = torch.randn(10, 128, 6).unsqueeze(1).to(torch.float).to(self.device) # HARD CODED for now!!!
             preds = self.model.generate(x0)[:, -1, :, :].cpu().detach()
             total_preds.append(preds)
         # set_trace()
@@ -298,15 +306,124 @@ class ProteinAngleFlowModule(pl.LightningModule):
         folder_name = os.path.join(self.exp_dir, epoch_folder_name)
         os.makedirs(folder_name, exist_ok=True)
         for i in range(6):
+            
             _ = plt.hist(angles.reshape(-1, 6)[:,i], bins=100, range=(-np.pi, np.pi), label="GT angles", alpha=0.5)
             _ = plt.hist(total_preds.reshape(-1, 6)[:,i], bins=100, range=(-np.pi, np.pi), label="Predicted angles", alpha=0.5)
             
             plt.legend()
+            
             plt.savefig(os.path.join(folder_name, f"angle_{i}_histogram.png"))
             if self.logger is not None:
                 self.logger.experiment.log({f"angle_{i}_histogram": [wandb.Image(os.path.join(folder_name, f"angle_{i}_histogram.png"))]})
-            # wandb.log({f"angle_{i}_histogram": wandb.Image(os.path.join(folder_name, f"angle_{i}_histogram.png"))})
             plt.close()
         return {
             'val_loss': loss
         }
+
+    def on_predict_epoch_start(self):
+        self.all_sample_trajectories = []
+
+    def predict_step(self, batch, batch_idx):
+        # set_trace()
+        print(f"inference temperature: {self.inference_temperature}")
+        length, num_samples_per_length = batch
+        x0 = torch.randn(num_samples_per_length.item(), length.item(), 6).unsqueeze(1).to(torch.float).to(self.device)   
+        preds = self.model.generate(x0, device=self.device, temperature=self.inference_temperature).cpu().detach() # []
+        preds_np= preds.numpy()
+        self.all_sample_trajectories.append(preds_np)
+        
+    def on_predict_epoch_end(self, results):
+        outdir = self.exp_dir
+        self.sampled = []
+        for array in self.all_sample_trajectories:
+            # Iterate through the first dimension (batch dimension) of the array
+            for i in range(array.shape[0]):
+                self.sampled.append(array[i])
+        # Now, self.sampled is a list of n_samples, where each element is an np array of shape [n_timepoints, sample_length, 6]
+        # Thus satisfying the requirements of FoldingDiff code
+        final_sampled = [s[-1] for s in self.sampled]
+        sampled_dfs = [
+            pd.DataFrame(s, columns=['phi', 'psi', 'omega', 'tau', 'CA:C:1N', 'C:1N:1CA']) # Hard coded for simplicity
+            for s in final_sampled
+        ]
+
+        # Plot histograms for the angles
+        total_sample_angles = np.vstack(final_sampled)
+        # set_trace()
+        train_angles = torch.load("/home/sh2748/foldingdiff/protein_angles_train.pt")
+        reshaped_train_angles = train_angles.reshape(-1,6)
+        mask = torch.any(reshaped_train_angles != 0, dim=1)
+        non_zero_angles = reshaped_train_angles[mask]
+        filtered_non_zero_angles = non_zero_angles[torch.randperm(non_zero_angles.size(0))][:total_sample_angles.shape[0]]
+        for i in range(6):
+            _ = plt.hist(filtered_non_zero_angles[:,i], bins=100, range=(-np.pi, np.pi), label="GT angles", alpha=0.5)
+            _ = plt.hist(total_sample_angles[:,i], bins=100, range=(-np.pi, np.pi), label="Predicted angles", alpha=0.5)
+            
+            # plt.ylim(0, 14000)
+            plt.legend()
+            plt.savefig(os.path.join(outdir, f"angle_{i}_histogram.png"))
+            if self.logger is not None:
+                self.logger.experiment.log({f"angle_{i}_histogram": [wandb.Image(os.path.join(outdir, f"angle_{i}_histogram.png"))]})
+            plt.close()
+
+        # set_trace()
+        # Write the raw sampled items to csv files
+        sampled_angles_folder = os.path.join(outdir, "sampled_angles")
+        os.makedirs(sampled_angles_folder, exist_ok=True)
+        print(f"Writing sampled angles to {sampled_angles_folder}")
+        for i, s in enumerate(sampled_dfs):
+            s.to_csv(os.path.join(sampled_angles_folder, f"generated_{i}.csv.gz"))
+        # Write the sampled angles as pdb files
+        pdb_files = self.write_preds_pdb_folder(sampled_dfs, os.path.join(outdir, "sampled_pdb"))
+
+        # Write the angles
+        full_history_angles_dir = os.path.join(sampled_angles_folder, "sample_history")
+        os.makedirs(full_history_angles_dir)
+        full_history_pdb_dir = os.path.join(outdir, "sampled_pdb/sample_history")
+        os.makedirs(full_history_pdb_dir)
+        # sampled is a list of np arrays
+        for i, sampled_series in enumerate(self.sampled):
+            snapshot_dfs = [
+                pd.DataFrame(snapshot, columns=['phi', 'psi', 'omega', 'tau', 'CA:C:1N', 'C:1N:1CA'])
+                for snapshot in sampled_series
+            ]
+            # Write the angles
+            ith_angle_dir = os.path.join(full_history_angles_dir, f"generated_{i}")
+            os.makedirs(ith_angle_dir, exist_ok=True)
+            for timestep, snapshot_df in enumerate(snapshot_dfs):
+                snapshot_df.to_csv(
+                    os.path.join(ith_angle_dir, f"generated_{i}_timestep_{timestep}.csv.gz")
+                )
+            # Write the pdb files
+            ith_pdb_dir = os.path.join(full_history_pdb_dir, f"generated_{i}")
+            self.write_preds_pdb_folder(
+                snapshot_dfs, ith_pdb_dir, basename_prefix=f"generated_{i}_timestep_"
+            )
+        
+    
+    @staticmethod
+    def write_preds_pdb_folder(
+        final_sampled,
+        outdir: str,
+        basename_prefix: str = "generated_",
+        threads: int = multiprocessing.cpu_count(),
+    ):
+        """
+        Write the predictions as pdb files in the given folder along with information regarding the
+        tm_score for each prediction. Returns the list of files written.
+        Copied from foldingdiff/bin/sample.py
+        """
+        os.makedirs(outdir, exist_ok=True)
+        print(
+            f"Writing sampled angles as PDB files to {outdir} using {threads} threads"
+        )
+        # Create the pairs of arguments
+        arg_tuples = [
+            (os.path.join(outdir, f"{basename_prefix}{i}.pdb"), samp)
+            for i, samp in enumerate(final_sampled)
+        ]
+        # Write in parallel
+        with multiprocessing.Pool(threads) as pool:
+            files_written = pool.starmap(create_new_chain_nerf, arg_tuples)
+
+        return files_written
