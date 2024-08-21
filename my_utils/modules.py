@@ -14,6 +14,7 @@ from ipdb import set_trace
 import pandas as pd
 import multiprocessing
 from foldingdiff.angles_and_coords import create_new_chain_nerf
+from tqdm import tqdm
 
 class SimpleMLP(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, dropout_prob=0.1):
@@ -185,11 +186,9 @@ class ProteinAngleFlowModel(nn.Module):
         return base_tensor.repeat_interleave(int(n_residues/self.num_res_per_group)).unsqueeze(0).unsqueeze(-1).repeat(batch_size, 1, 1)
 
     def forward(self, protein_angles, device):
-        residue_embeds = self.proj_in(protein_angles) # [b, t, s, d]
-        _b, _t, _s, _d = residue_embeds.shape
-        # print(f"Batch size: {_b}")
-        group_embeds = rearrange(residue_embeds, 'b t (s0 g) d -> b (t s0) (g d)', g = self.num_res_per_group) # [b, t*s/g, g*d], g: num_res_per_group
-
+        group_embeds = self.proj_in(protein_angles) # [b, t*s/g, g*d], g: num_res_per_group
+        _b = group_embeds.shape[0]
+        _s = int(group_embeds.shape[1]*self.num_res_per_group/self.model_cfg.n_timepoints)
         if self.model_cfg.global_pe:
             # set_trace()
             time_encoding = self._global_pe(_b, _s, device)
@@ -199,7 +198,8 @@ class ProteinAngleFlowModel(nn.Module):
         llm_outputs = self.llm_model(inputs_embeds=group_embeds)
         llm_outputs_embeds = llm_outputs.last_hidden_state
         vae_outputs, vae_latents, vae_dist = self.vae_decoder(llm_outputs_embeds)
-        outputs_embeds = rearrange(vae_outputs, 'b (t s0) (g d) -> b t (s0 g) d', s0=int(_s/self.num_res_per_group),g = self.num_res_per_group) # [b, t, s, d], g: num_res_per_group
+        # outputs_embeds = rearrange(vae_outputs, 'b (t s0) (g d) -> b t (s0 g) d', s0=int(_s/self.num_res_per_group),g = self.num_res_per_group) # [b, t, s, d], g: num_res_per_group
+        outputs_embeds = vae_outputs
         outputs_embeds = modulo_with_wrapped_range(outputs_embeds)
         # KL divergence loss
         z_cond_dist = vae_dist
@@ -215,34 +215,33 @@ class ProteinAngleFlowModel(nn.Module):
             'output_embeds': outputs_embeds,
             'kl_divergence': kl_divergence_z.mean()
         }
-    
-    def generate_next_tokens(self, protein_angles, device, temperature=1):
-        assert not temperature < 0, "Temperature should be non-negative!"
-        residue_embeds = self.proj_in(protein_angles) # [b, t, s, d]
-        _b, _t, _s, _d = residue_embeds.shape
-        group_embeds = rearrange(residue_embeds, 'b t (s0 g) d -> b (t s0) (g d)', g = self.num_res_per_group) # [b, t*s/g, g*d], g: num_res_per_group
-        
-        if self.model_cfg.global_pe:
-            time_encoding = torch.arange(1, _t+1, device=device, dtype=torch.float)
-            time_encoding = time_encoding.repeat_interleave(int(_s/self.num_res_per_group)).unsqueeze(0).unsqueeze(-1).repeat(_b, 1, 1)
-            time_encoding = self.global_pe_encoder(time_encoding)
-            group_embeds = group_embeds + time_encoding
-
-        
-        llm_outputs = self.llm_model(inputs_embeds=group_embeds)
-        llm_outputs_embeds = llm_outputs.last_hidden_state
-        vae_outputs, vae_latents, vae_dist = self.vae_decoder(llm_outputs_embeds, temperature=temperature)
-        outputs_embeds = rearrange(vae_outputs, 'b (t s0) (g d) -> b t (s0 g) d', s0=int(_s/self.num_res_per_group),g = self.num_res_per_group) # [b, t, s, d], g: num_res_per_group
-        outputs_embeds = modulo_with_wrapped_range(outputs_embeds)
-        
-        return outputs_embeds[:,-1,:,:].unsqueeze(1)
 
     def generate(self, input_ids, device, temperature=1, max_length=8):
-        output_sequences = input_ids
-        while output_sequences.shape[1] < max_length:
-            next_tokens = self.generate_next_tokens(output_sequences, temperature=temperature, device=device)
-            output_sequences = torch.cat([output_sequences, next_tokens], dim=1)
-        return output_sequences
+        print(f"Generation temperature is {temperature}")
+        output_sequences = input_ids # input_ids is x0, [b, 1, s, 6]
+        # set_trace()
+        _b, _, _s, _ = output_sequences.shape
+        output_sequences = rearrange(output_sequences, 'b t (s0 g) d -> b (t s0) (g d)', g = self.num_res_per_group) #[b, t*s/g, g*d]
+        timesteps = torch.ones(_b, _s, device=device, dtype=torch.float).unsqueeze(-1) # [b, s, 1], the initial timesteps, full of 1's
+        pbar = tqdm(total=max_length * _s - output_sequences.shape[1])
+        while output_sequences.shape[1] < max_length * _s:
+            group_embeds = self.proj_in(output_sequences) # [b, t*s/g, g*d]
+            
+            if self.model_cfg.global_pe:
+                time_encoding = self.global_pe_encoder(timesteps)
+                group_embeds = group_embeds + time_encoding
+
+            llm_outputs = self.llm_model(inputs_embeds=group_embeds)
+            llm_outputs_embeds = llm_outputs.last_hidden_state
+            vae_outputs, vae_latents, vae_dist = self.vae_decoder(llm_outputs_embeds, temperature=temperature)
+            
+            outputs_embeds = modulo_with_wrapped_range(vae_outputs)
+            output_sequences = torch.cat([output_sequences, outputs_embeds[:,-1,:][:, None, :]], dim=1)
+            next_timestep = torch.full((_b,1,1), timesteps.shape[1] // _s + 1, device=device, dtype=torch.float)
+            timesteps = torch.cat([timesteps, next_timestep], dim=1)
+            pbar.update(1)
+        pbar.close()
+        return output_sequences # [b, t*s/g, g*d]
 
 class ProteinAngleFlowModule(pl.LightningModule):
     def __init__(self, cfg, exp_dir):
@@ -271,8 +270,11 @@ class ProteinAngleFlowModule(pl.LightningModule):
         xt = modulo_with_wrapped_range(xt).to(torch.float32) #[b, t, length, 6]
 
         # set_trace()
+        xt = rearrange(xt, 'b t (s0 g) d -> b (t s0) (g d)', g = self.model_cfg.llm.num_res_per_group) # [b, t*s/g, 6*g]
+        # set_trace()
         
         outputs = self.model(xt, device=self.device)
+        # set_trace()
         shifted_pred_tokens = outputs["output_embeds"][:, :-1, ...]
         shifted_gt_tokens = xt[:,1:,...] 
         mse_loss = F.mse_loss(shifted_pred_tokens, shifted_gt_tokens, reduction="none").sum(dim=-1).mean()
@@ -295,10 +297,11 @@ class ProteinAngleFlowModule(pl.LightningModule):
         
         total_preds = []
         epoch_folder_name=f"epoch_{self.current_epoch+1}"
-        for i in range(10): # 5 is HARD CODED for now!!!
+        for i in tqdm(range(10)): #HARD CODED for now!!!
             x0 = torch.randn(10, 128, 6).unsqueeze(1).to(torch.float).to(self.device) # HARD CODED for now!!!
-            preds = self.model.generate(x0)[:, -1, :, :].cpu().detach()
-            total_preds.append(preds)
+            preds = self.model.generate(x0, device=self.device).cpu().detach()
+            preds = rearrange(preds, 'b (t s) (g d) -> b t (s g) d', s=x0.shape[2], g=self.model_cfg.llm.num_res_per_group)
+            total_preds.append(preds[:,-1,...])
         # set_trace()
         total_preds = torch.cat(total_preds, dim=0).reshape(-1, 6)
         angles = torch.load(self.cfg.data.data_path)[:100]
@@ -325,7 +328,7 @@ class ProteinAngleFlowModule(pl.LightningModule):
 
     def predict_step(self, batch, batch_idx):
         # set_trace()
-        print(f"inference temperature: {self.inference_temperature}")
+        print(f"Inference temperature: {self.inference_temperature}")
         length, num_samples_per_length = batch
         x0 = torch.randn(num_samples_per_length.item(), length.item(), 6).unsqueeze(1).to(torch.float).to(self.device)   
         preds = self.model.generate(x0, device=self.device, temperature=self.inference_temperature).cpu().detach() # []
