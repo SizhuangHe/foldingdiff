@@ -60,6 +60,7 @@ ANGLES_DEFINITIONS = Literal[
     "canonical", "canonical-full-angles", "canonical-minimal-angles", "cart-coords"
 ]
 
+torch.set_float32_matmul_precision('medium')
 @hydra.main(config_path="my_configs", config_name="train")
 def main(cfg: DictConfig):
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
@@ -86,7 +87,7 @@ def main(cfg: DictConfig):
     protein_angle_flow_module = ProteinAngleFlowModule(cfg=cfg, exp_dir=exp_folder_name)
     # set_trace()
     devices = GPUtil.getAvailable(order='memory', limit = 8)[:cfg.experiment.num_devices]
-    trainer = pl.Trainer(replace_sampler_ddp=False,logger=logger, callbacks=checkpoint_callback, strategy=DDPStrategy(find_unused_parameters=False), devices=devices, **cfg.trainer)
+    trainer = pl.Trainer(precision='bf16-mixed', use_distributed_sampler=False,logger=logger, callbacks=checkpoint_callback, strategy=DDPStrategy(find_unused_parameters=False), devices=devices, **cfg.trainer)
     trainer.fit(protein_angle_flow_module, data_module, ckpt_path=cfg.experiment.resume_path)
 
     

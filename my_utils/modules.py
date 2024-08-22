@@ -15,6 +15,7 @@ import pandas as pd
 import multiprocessing
 from foldingdiff.angles_and_coords import create_new_chain_nerf
 from tqdm import tqdm
+from pytorch_lightning.loggers import WandbLogger
 
 class SimpleMLP(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, dropout_prob=0.1):
@@ -141,12 +142,12 @@ class ProteinAngleFlowModel(nn.Module):
         self.model_cfg=model_cfg
         self.num_res_per_group = llm_cfg.num_res_per_group
         self.proj_in = SimpleMLP(input_size=model_cfg.input_size, hidden_size=model_cfg.proj_hid_size, output_size=int(llm_cfg.llm_embd_size/llm_cfg.num_res_per_group))
-        self._create_llm(llm_cfg.llm_name, llm_cfg.use_custom_gpt2_arch, llm_cfg.use_pretrained_weights, llm_cfg.llm_embd_size, llm_cfg.llm_n_layer, llm_cfg.llm_n_head)
+        self._create_llm(llm_cfg.llm_name, llm_cfg.use_custom_gpt2_arch, llm_cfg.use_pretrained_weights, llm_cfg.use_flash_attn,llm_cfg.llm_embd_size, llm_cfg.llm_n_layer, llm_cfg.llm_n_head)
         self.vae_decoder = CustomVAEDecoder(input_dim=llm_cfg.llm_embd_size, vae_latent_dim=vae_cfg.vae_latent_dim, decoder_hidden_dim=vae_cfg.decoder_hidden_dim, output_dim=model_cfg.input_size*llm_cfg.num_res_per_group)
         if self.model_cfg.global_pe:
             self.global_pe_encoder = SimpleMLP(input_size=1, hidden_size=model_cfg.proj_hid_size, output_size=llm_cfg.llm_embd_size)
 
-    def _create_llm(self, llm_name, use_custom_gpt2_arch, use_pretrained_weights, llm_embd_size, llm_n_layer, llm_n_head):
+    def _create_llm(self, llm_name, use_custom_gpt2_arch, use_pretrained_weights, use_flash_attn, llm_embd_size, llm_n_layer, llm_n_head):
         if llm_name == "gpt2": 
             print("Use GPT2 as LLM.")
             if not use_custom_gpt2_arch:
@@ -154,7 +155,12 @@ class ProteinAngleFlowModel(nn.Module):
                 if llm_embd_size != 768:
                     print(f"Override GPT2 dimension from {self._gpt_conf.n_embd} to 768!")
                 if use_pretrained_weights:
-                    self.llm_model = GPT2Model.from_pretrained('gpt2') 
+                    if use_flash_attn:
+                        print("Use flash attention!")
+                        self.llm_model = GPT2Model.from_pretrained('gpt2', attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16)
+                    else:
+                        print("Not using flash attention!")
+                        self.llm_model = GPT2Model.from_pretrained('gpt2')
                     print("Use GPT2 model with PRETRAINED weights!")
                 else:
                     config = GPT2Config()  # Default GPT-2 configuration
@@ -181,8 +187,8 @@ class ProteinAngleFlowModel(nn.Module):
                 self.llm_model = AutoModel.from_config(pythia_config)
                 print(f"Use {llm_name} model with RANDOM weights!")
 
-    def _global_pe(self, batch_size, n_residues, device):
-        base_tensor = torch.arange(1, self.model_cfg.n_timepoints + 1, device=device, dtype=torch.float)
+    def _global_pe(self, batch_size, n_residues, device, dtype):
+        base_tensor = torch.arange(1, self.model_cfg.n_timepoints + 1, device=device, dtype=dtype)
         return base_tensor.repeat_interleave(int(n_residues/self.num_res_per_group)).unsqueeze(0).unsqueeze(-1).repeat(batch_size, 1, 1)
 
     def forward(self, protein_angles, device):
@@ -191,7 +197,7 @@ class ProteinAngleFlowModel(nn.Module):
         _s = int(group_embeds.shape[1]*self.num_res_per_group/self.model_cfg.n_timepoints)
         if self.model_cfg.global_pe:
             # set_trace()
-            time_encoding = self._global_pe(_b, _s, device)
+            time_encoding = self._global_pe(_b, _s, device, dtype=group_embeds.dtype)
             time_encoding = self.global_pe_encoder(time_encoding)
             group_embeds = group_embeds + time_encoding
    
@@ -222,7 +228,7 @@ class ProteinAngleFlowModel(nn.Module):
         # set_trace()
         _b, _, _s, _ = output_sequences.shape
         output_sequences = rearrange(output_sequences, 'b t (s0 g) d -> b (t s0) (g d)', g = self.num_res_per_group) #[b, t*s/g, g*d]
-        timesteps = torch.ones(_b, _s, device=device, dtype=torch.float).unsqueeze(-1) # [b, s, 1], the initial timesteps, full of 1's
+        timesteps = torch.ones(_b, _s, device=device, dtype=output_sequences.dtype).unsqueeze(-1) # [b, s, 1], the initial timesteps, full of 1's
         pbar = tqdm(total=max_length * _s - output_sequences.shape[1])
         while output_sequences.shape[1] < max_length * _s:
             group_embeds = self.proj_in(output_sequences) # [b, t*s/g, g*d]
@@ -237,7 +243,7 @@ class ProteinAngleFlowModel(nn.Module):
             
             outputs_embeds = modulo_with_wrapped_range(vae_outputs)
             output_sequences = torch.cat([output_sequences, outputs_embeds[:,-1,:][:, None, :]], dim=1)
-            next_timestep = torch.full((_b,1,1), timesteps.shape[1] // _s + 1, device=device, dtype=torch.float)
+            next_timestep = torch.full((_b,1,1), timesteps.shape[1] // _s + 1, device=device, dtype=output_sequences.dtype)
             timesteps = torch.cat([timesteps, next_timestep], dim=1)
             pbar.update(1)
         pbar.close()
@@ -267,7 +273,7 @@ class ProteinAngleFlowModule(pl.LightningModule):
         x0 = modulo_with_wrapped_range(torch.randn_like(batch_angles))
         t, xt, mu_t = self.integral_flow_matcher.sample_conditional_flow(rearrange(x0, 'b s d -> b (s d)').to("cuda"), rearrange(batch_angles, 'b s d -> b (s d)').to("cuda"), self.model_cfg.n_timepoints,  device = "cuda")
         xt = rearrange(xt, 'b t (s d) -> b t s d', s=x0.shape[1])
-        xt = modulo_with_wrapped_range(xt).to(torch.float32) #[b, t, length, 6]
+        xt = modulo_with_wrapped_range(xt).to(x0.dtype) #[b, t, length, 6]
 
         # set_trace()
         xt = rearrange(xt, 'b t (s0 g) d -> b (t s0) (g d)', g = self.model_cfg.llm.num_res_per_group) # [b, t*s/g, 6*g]
@@ -298,7 +304,7 @@ class ProteinAngleFlowModule(pl.LightningModule):
         total_preds = []
         epoch_folder_name=f"epoch_{self.current_epoch+1}"
         for i in tqdm(range(10)): #HARD CODED for now!!!
-            x0 = torch.randn(10, 128, 6).unsqueeze(1).to(torch.float).to(self.device) # HARD CODED for now!!!
+            x0 = torch.randn(10, 128, 6).unsqueeze(1).to(batch[0].dtype).to(self.device) # HARD CODED for now!!!
             preds = self.model.generate(x0, device=self.device).cpu().detach()
             preds = rearrange(preds, 'b (t s) (g d) -> b t (s g) d', s=x0.shape[2], g=self.model_cfg.llm.num_res_per_group)
             total_preds.append(preds[:,-1,...])
@@ -316,7 +322,7 @@ class ProteinAngleFlowModule(pl.LightningModule):
             plt.legend()
             
             plt.savefig(os.path.join(folder_name, f"angle_{i}_histogram.png"))
-            if self.logger is not None:
+            if self.logger is not None and isinstance(self.logger, WandbLogger):
                 self.logger.experiment.log({f"angle_{i}_histogram": [wandb.Image(os.path.join(folder_name, f"angle_{i}_histogram.png"))]})
             plt.close()
         return {
@@ -365,7 +371,7 @@ class ProteinAngleFlowModule(pl.LightningModule):
             # plt.ylim(0, 14000)
             plt.legend()
             plt.savefig(os.path.join(outdir, f"angle_{i}_histogram.png"))
-            if self.logger is not None:
+            if self.logger is not None and isinstance(self.logger, WandbLogger):
                 self.logger.experiment.log({f"angle_{i}_histogram": [wandb.Image(os.path.join(outdir, f"angle_{i}_histogram.png"))]})
             plt.close()
 

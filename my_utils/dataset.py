@@ -53,13 +53,9 @@ class ProteinAngleDataModule(pl.LightningDataModule):
         self.test_dataset = CustomDataset(self.test_angles_dir, self.test_lengths_dir)
 
     def train_dataloader(self):
-        rank = self.trainer.local_rank
-        if isinstance(self.trainer.gpus, list):
-            num_replicas = self.trainer.num_nodes * len(self.trainer.gpus)
-        elif isinstance(self.trainer.gpus, int):
-            num_replicas = self.trainer.num_nodes * self.trainer.gpus
-        else:
-            raise Exception("What is self.trainer.gpus?")
+        rank = self.trainer.global_rank
+        # set_trace()
+        num_replicas = self.trainer.num_nodes * self.trainer.strategy.num_processes
         print(f"rank: {rank}, num_replicas: {num_replicas}")
         # set_trace()
         sampler = DistributedLengthBasedSampler(torch.load(self.train_lengths_dir), self.batch_size, drop_last=False, rank=rank, num_replicas=num_replicas)
