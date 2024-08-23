@@ -1,3 +1,24 @@
+# Sizhuang's changes
+## Dataset
+- I only used their clean angle dataset. For the flow matching part, I used the `IntegralFlowMatcher` class implemented by myself that create a conditional probability path given `x0` and `x1` with multiple time points.
+- To make things easier, I create the dataset and saved them as torch tensors (`.pt` files). This is done in `process_dataset.ipynb`.
+### Dataloaders
+- I implemented a custom `DistributedSampler`, in `my_utils/custom_sampler.py`, that produces proteins with the same length inside one batch. It is being used in `my_utils/dataset.py'.
+
+## Model
+- `my_utils/modules.py` implements the full training/validation/prediction pipeline in `pytorch_lightning` format.
+- The overall training pipeline can be simplified as:
+  1. Sample FM conditional path. (`x0`, `x1` and `xt ~ N(t*x1+(1-t)*x0, sigma)`)
+  2. Tokenize. Split proteins into residues and order them accordingly.
+  3. Pass to the model.
+    1. MLP map angle sets to tokens
+    2. Apply global time encoding
+    3. LLM processing
+    4. VAE sampling
+## Try training
+First, do `process_dataset.ipynb' to get the datasets.
+Then, run `train_proteinangle_ifm.py`. Note this requires flash-attention, which is a bit difficult to install the environments. For simplicity, just remove it.
+
 # foldingdiff - Diffusion model for protein backbone generation
 
 [![DOI](https://zenodo.org/badge/509133407.svg)](https://zenodo.org/doi/10.5281/zenodo.10365889) [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black) ![PyTorch Lightning](https://img.shields.io/badge/pytorch-lightning-blue.svg?logo=PyTorch%20Lightning)
