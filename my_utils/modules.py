@@ -189,12 +189,12 @@ class ProteinAngleFlowModel(nn.Module):
 
     def _global_pe(self, batch_size, n_residues, device, dtype):
         base_tensor = torch.arange(1, self.model_cfg.n_timepoints + 1, device=device, dtype=dtype)
-        return base_tensor.repeat_interleave(int(n_residues/self.num_res_per_group)).unsqueeze(0).unsqueeze(-1).repeat(batch_size, 1, 1)
+        return base_tensor.repeat_interleave(int(n_residues/self.num_res_per_group)).unsqueeze(0).unsqueeze(-1).repeat(batch_size, 1, 1) # [b, t*s/g, 1]
 
-    def forward(self, protein_angles, device):
+    def forward(self, protein_angles, protein_length, device):
         group_embeds = self.proj_in(protein_angles) # [b, t*s/g, g*d], g: num_res_per_group
         _b = group_embeds.shape[0]
-        _s = int(group_embeds.shape[1]*self.num_res_per_group/self.model_cfg.n_timepoints)
+        _s = protein_length
         if self.model_cfg.global_pe:
             # set_trace()
             time_encoding = self._global_pe(_b, _s, device, dtype=group_embeds.dtype)
@@ -204,19 +204,19 @@ class ProteinAngleFlowModel(nn.Module):
         llm_outputs = self.llm_model(inputs_embeds=group_embeds)
         llm_outputs_embeds = llm_outputs.last_hidden_state
         vae_outputs, vae_latents, vae_dist = self.vae_decoder(llm_outputs_embeds)
-        # outputs_embeds = rearrange(vae_outputs, 'b (t s0) (g d) -> b t (s0 g) d', s0=int(_s/self.num_res_per_group),g = self.num_res_per_group) # [b, t, s, d], g: num_res_per_group
         outputs_embeds = vae_outputs
-        outputs_embeds = modulo_with_wrapped_range(outputs_embeds)
+        outputs_embeds = modulo_with_wrapped_range(outputs_embeds) # [b, t*s/g, 6]
         # KL divergence loss
         z_cond_dist = vae_dist
         z_prior_dist = Normal(torch.zeros_like(vae_latents), torch.ones_like(vae_latents))
         # set_trace()
+
         kl_divergence_z = kl_divergence(
                         z_cond_dist,
                         z_prior_dist
-                    )
-        kl_divergence_z = rearrange(kl_divergence_z, 'b (t s0) (g d) -> b t (s0 g) d', s0=int(_s/self.num_res_per_group), g=self.num_res_per_group) #[b, t, s, d]
-        kl_divergence_z = kl_divergence_z.sum(dim=-1)[:,:-1,:] # throw away the last time point
+                    ) # [b, t*s/g, d_vae]
+        kl_divergence_z = kl_divergence_z.sum(dim=-1)[:,:-1] # throw away the last time point
+        # set_trace()
         return {
             'output_embeds': outputs_embeds,
             'kl_divergence': kl_divergence_z.mean()
@@ -227,8 +227,8 @@ class ProteinAngleFlowModel(nn.Module):
         output_sequences = input_ids # input_ids is x0, [b, 1, s, 6]
         # set_trace()
         _b, _, _s, _ = output_sequences.shape
-        output_sequences = rearrange(output_sequences, 'b t (s0 g) d -> b (t s0) (g d)', g = self.num_res_per_group) #[b, t*s/g, g*d]
-        timesteps = torch.ones(_b, _s, device=device, dtype=output_sequences.dtype).unsqueeze(-1) # [b, s, 1], the initial timesteps, full of 1's
+        output_sequences = rearrange(output_sequences, 'b t (s0 g) d -> b (t s0) (g d)', g = self.num_res_per_group) #[b, t*s/g, g*d], currently it's [b, s, 1]
+        timesteps = torch.ones(_b, _s, device=device, dtype=output_sequences.dtype).unsqueeze(-1) # [b, s, 1], the initial timesteps, full of 1's, may not work when g > 1
         pbar = tqdm(total=max_length * _s - output_sequences.shape[1])
         while output_sequences.shape[1] < max_length * _s:
             group_embeds = self.proj_in(output_sequences) # [b, t*s/g, g*d]
@@ -279,7 +279,7 @@ class ProteinAngleFlowModule(pl.LightningModule):
         xt = rearrange(xt, 'b t (s0 g) d -> b (t s0) (g d)', g = self.model_cfg.llm.num_res_per_group) # [b, t*s/g, 6*g]
         # set_trace()
         
-        outputs = self.model(xt, device=self.device)
+        outputs = self.model(xt, length, device=self.device)
         # set_trace()
         shifted_pred_tokens = outputs["output_embeds"][:, :-1, ...]
         shifted_gt_tokens = xt[:,1:,...] 
@@ -407,8 +407,7 @@ class ProteinAngleFlowModule(pl.LightningModule):
             ith_pdb_dir = os.path.join(full_history_pdb_dir, f"generated_{i}")
             self.write_preds_pdb_folder(
                 snapshot_dfs, ith_pdb_dir, basename_prefix=f"generated_{i}_timestep_"
-            )
-        
+            ) 
     
     @staticmethod
     def write_preds_pdb_folder(
