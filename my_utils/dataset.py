@@ -28,7 +28,6 @@ class PredictionLengthDataset(Dataset):
     def __getitem__(self, idx):
         return self.lengths[idx], self.num_samples_per_length
 
-
 class ProteinAngleDataModule(pl.LightningDataModule):
     def __init__(self, 
         train_angles_dir="/home/sh2748/foldingdiff/protein_angles_train.pt", 
@@ -72,3 +71,36 @@ class ProteinAngleDataModule(pl.LightningDataModule):
         return DataLoader(predict_dataset, batch_size=1)
 
 
+class SanityCheckDataset(Dataset):
+    def __init__(self, data, lengths):
+        self.data = data
+        self.lengths = lengths
+        assert len(self.data) == len(self.lengths), "Invalid lengths"
+    
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx], self.lengths[idx]
+
+class SanityCheckDataModule(pl.LightningDataModule):
+    def __init__(self, data_path, subset_size=100, batch_size=32):
+        super().__init__()
+        self.data_path = data_path
+        self.subset_size = subset_size
+        self.batch_size = batch_size
+
+    def setup(self, stage: str):
+        self.data = torch.load(self.data_path)[:self.subset_size]
+        self.lengths = torch.full((self.subset_size,), 128)
+        rng = torch.Generator().manual_seed(42)
+        self.train_data, self.val_data = random_split(self.data, [0.8, 0.2], generator=rng)
+        self.train_lengths, self.val_lengths = random_split(self.lengths, [0.8, 0.2], generator=rng)
+        self.train_dataset = SanityCheckDataset(self.train_data, self.train_lengths)
+        self.val_dataset = SanityCheckDataset(self.val_data, self.val_lengths)
+    
+    def train_dataloader(self):
+        return DataLoader(self.train_dataset, self.batch_size)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_dataset, self.batch_size)

@@ -314,6 +314,11 @@ class ProteinAngleFlowModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         # set_trace()
         mse_loss, kl_div = self.model_step(batch)
+        loss_masks = torch.ones_like(mse_loss, dtype=torch.bool)
+        loss_masks[:, :127] = False
+        mse_loss = mse_loss * loss_masks
+        kl_div = kl_div * loss_masks
+        # set_trace()
         loss = mse_loss.mean() + self.cfg.experiment.beta * kl_div.mean()
 
         self.log('train_mse_loss', mse_loss.mean().item(), on_step=True, on_epoch=True, prog_bar=True)
